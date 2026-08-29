@@ -8,20 +8,22 @@ This repository contains the source code for the paper: **"From Heavy-Tailed Vol
 
 It provides the complete trace-driven simulator (Python) and the real-world distributed testbed (C++ & gRPC) to evaluate the **IF-Pareto** scheduling framework against heavy-tailed cloud workloads.
 
-## 🗂 Repository Structure
+## Repository Structure
 *   `if_pareto_simulator.py`: The core trace-driven simulator evaluating P2C, MeanRiskMulti, LBMBP, Prob, and IF-Pareto. Includes ablation studies and generates academic-grade PDF plots.
 *   `run_gcp_testbed.sh`: Automated bash script to provision Google Cloud Platform (GCP) VMs, compile the C++17 gRPC framework, and measure genuine sub-millisecond end-to-end deployment latency.
 *   `google.csv` / `alibaba.csv`: Sample traces containing extracted resource means and variances *(Note: Please ensure the trace data is placed in the root directory before execution)*.
 
-## 🚀 1. Running the Trace-Driven Simulator
+## Running the Trace-Driven Simulator
 
 The simulator relies on standard data science packages.
-```bash
+
 # Install dependencies
+Bash
 pip install numpy pandas scikit-learn seaborn matplotlib scipy tqdm
 
-## Execution Options
-# Option A: Local Environment
+# Execution Options
+
+* Option A: Local Environment
 
 Ensure google.csv and alibaba.csv are placed in the same directory as if_pareto_simulator.py (which acts as the root path . by default).
 
@@ -30,7 +32,7 @@ Run the simulator:
 Bash
 python3 if_pareto_simulator.py
 
-# Option B: Google Colab Environment
+* Option B: Google Colab Environment
 
 The script automatically detects if it is running inside Google Colab and will prompt you to mount your Google Drive.
 
