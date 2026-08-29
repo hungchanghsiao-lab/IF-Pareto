@@ -1,0 +1,16 @@
+Deploying the C++ GCP End-to-End Testbed
+
+To reproduce the sub-millisecond latency results highlighted in our paper, we provide a fully automated script to deploy a master-worker architecture on GCP.
+
+Prerequisites: Ensure you have the gcloud CLI installed and authenticated.
+
+# Execute the automated deployment
+chmod +x run_gcp_testbed.sh
+./run_gcp_testbed.sh
+
+What the script does:
+1) Provisions 4 e2-medium instances (1 Master, 3 Workers) in the same Virtual Private Cloud (VPC).
+2) Automatically installs the gRPC and Protocol Buffers C++ toolchains.
+3) Compiles master.cc and worker.cc using c++17.
+4) Executes 5,000 asynchronous task placements, logging the genuine wall-clock latency encompassing algorithmic scanning ($O(N)$), serialization, and VPC network transmission.
+5) Downloads the latency_results_cpp.csv to your local environment for CDF plotting.
