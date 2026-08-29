@@ -20,7 +20,22 @@ The simulator relies on standard data science packages.
 # Install dependencies
 pip install numpy pandas scikit-learn seaborn matplotlib scipy tqdm
 
-# Execute the simulation
+## Execution Options
+# Option A: Local Environment
+
+Ensure google.csv and alibaba.csv are placed in the same directory as if_pareto_simulator.py (which acts as the root path . by default).
+
+Run the simulator:
+
+Bash
 python3 if_pareto_simulator.py
+
+# Option B: Google Colab Environment
+
+The script automatically detects if it is running inside Google Colab and will prompt you to mount your Google Drive.
+
+Ensure your workload traces (google.csv and alibaba.csv) are placed inside your Google Drive folder at: /MyDrive/IFexp/.
+
+Run the cells to generate all simulation results, metrics, and plots.
 
 Upon completion, the simulator will automatically generate high-resolution, rasterized .pdf files inside the simulation_results/ directory, including P95 Boxplots, Load Imbalance Degree (LID), CDF curves, and Multi-dimensional Scatter Plots.
