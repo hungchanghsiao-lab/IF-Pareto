@@ -4,7 +4,8 @@
 IF-Pareto Trace-Driven Simulator
 ================================
 Evaluates the Dual-Regime IF-Pareto scheduler against state-of-the-art baselines
-(P2C, MeanRiskMulti, LBMBP, Prob) using real-world heavy-tailed traces.
+(P2C, MeanRiskMulti, LBMBP, Prob) and ablation variants (IF-SafeOnly, IF-RiskyOnly)
+using real-world heavy-tailed traces (Alibaba and Google).
 
 Submission: IEEE TPDS
 """
@@ -19,7 +20,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import logging
 import sys
-from scipy.stats import norm
+from scipy.stats import norm, skew, kurtosis
 import time
 import warnings
 
@@ -36,20 +37,25 @@ except ImportError:
 # =============================================================================
 # Global Configuration & Hyperparameters
 # =============================================================================
-SCRIPT_VERSION = "v4.0_Release"
-N_SERVERS = 50                 # Logical cluster size
+SCRIPT_VERSION = "v4.1_TPDS_Revision"
+RANDOM_SEED = 42               # Global seed for full reproducibility
+N_SERVERS = 50                 # Logical cluster size (Section IV-C)
 M_TASKS = 4000                 # Tasks per simulation round (High contention density)
-R_ROUNDS = 100                 # Independent simulation rounds for steady-state
+R_ROUNDS = 200                 # 200 independent simulation rounds (matches Section IV-C & Figs. 2-9)
 Z_SCORE_P95 = 1.645            # Gaussian quantile proxy for 95th percentile risk
-N_ROUNDS_SENSITIVITY = 100     # Rounds for hyperparameter sensitivity analysis
+N_ROUNDS_SENSITIVITY = 200     # 200 rounds for hyperparameter sensitivity analysis
 
 # Evaluation switches
+RUN_WORKLOAD_ANALYSIS = True
 RUN_COMPARISON = True
 RUN_LATENCY_TEST = True
 RUN_SENSITIVITY_ANALYSIS = True
+PLOT_GCP_TESTBED_CDF = True
 
 SELECTED_WORKLOADS = ['google', 'alibaba']
-ENABLED_SCHEDULERS_LIST = ['P2C', 'MeanRiskMulti', 'IF_Pareto', 'LBMBP', 'PROB', 'IF_SafeOnly', 'IF_RiskyOnly']
+ENABLED_SCHEDULERS_LIST = [
+    'P2C', 'MeanRiskMulti', 'IF_Pareto', 'LBMBP', 'PROB', 'IF_SafeOnly', 'IF_RiskyOnly'
+]
 ENABLE_HARD_CAPACITY_CHECK = True
 
 # Isolation Forest (IF) Hyperparameters
@@ -84,18 +90,23 @@ ALL_WORKLOAD_PROFILES = {
     'google': os.path.join(ROOT_DIR, "google.csv")
 }
 
+GCP_LATENCY_CSV_PATH = os.path.join(ROOT_DIR, "latency_results_cpp.csv")
+
 # =============================================================================
-# Data Loading & ML Pipeline
+# Data Loading, Statistical Characterization & ML Pipeline
 # =============================================================================
 def load_raw_data(filepath):
     """Loads workload trace and normalizes multi-dimensional features if required."""
     logging.info(f"Loading trace: '{filepath}'...")
     try:
         if not os.path.exists(filepath):
-            logging.warning(f"File {filepath} not found. Generating synthetic data.")
+            logging.warning(f"File {filepath} not found. Generating synthetic fallback data.")
+            rng = np.random.default_rng(RANDOM_SEED)
             data = {
-                'cpu_mean': np.random.rand(5000), 'mem_mean': np.random.rand(5000),
-                'cpu_variance': np.random.rand(5000) * 0.05, 'mem_variance': np.random.rand(5000) * 0.05
+                'cpu_mean': rng.random(5000) * 0.1,
+                'mem_mean': rng.random(5000) * 0.1,
+                'cpu_variance': rng.random(5000) * 0.05,
+                'mem_variance': rng.random(5000) * 0.05
             }
             task_pool = pd.DataFrame(data)
         else:
@@ -116,6 +127,62 @@ def load_raw_data(filepath):
 
     return task_pool
 
+def analyze_and_plot_workload_stats(loaded_traces, output_dir):
+    """Computes skewness and kurtosis (Table II) and generates CCDF plots (Fig. 1)."""
+    logging.info("\n--- Workload Statistical Characterization (Table II) ---")
+    features = ['cpu_mean', 'mem_mean', 'cpu_variance', 'mem_variance']
+    
+    for name, df in loaded_traces.items():
+        logging.info(f"[{name.upper()} Trace Statistics]")
+        for feat in features:
+            vals = df[feat].dropna().values
+            s_val = skew(vals)
+            k_val = kurtosis(vals)
+            logging.info(f"  {feat:<15} | Skewness: {s_val:>8.2f} | Kurtosis: {k_val:>8.2f}")
+
+    if not loaded_traces:
+        return
+
+    plt.rcParams.update({'font.family': 'DejaVu Sans', 'font.size': 18, 'axes.labelsize': 20})
+    colors = {'alibaba': 'orange', 'google': 'blue'}
+    labels = {'alibaba': 'Alibaba', 'google': 'Google'}
+
+    # 1. CPU Mean CCDF (Fig. 1 Left)
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for name, df in loaded_traces.items():
+        vals = np.sort(df['cpu_mean'].dropna().values)
+        vals = vals[vals > 0]
+        ccdf = 1.0 - np.arange(1, len(vals) + 1) / len(vals)
+        ax.scatter(vals, ccdf, label=labels.get(name, name), color=colors.get(name, 'black'),
+                   s=10, alpha=0.6, rasterized=True)
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_xlabel('Value')
+    ax.set_ylabel('CCDF P(X > x)')
+    ax.legend(loc='lower left')
+    ax.grid(True, which="both", linestyle='--', alpha=0.4)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "analysis_cpu_mean_ccdf.pdf"), bbox_inches='tight', dpi=300)
+    plt.close()
+
+    # 2. Memory Variance CCDF (Fig. 1 Right)
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for name, df in loaded_traces.items():
+        vals = np.sort(df['mem_variance'].dropna().values)
+        vals = vals[vals > 0]
+        ccdf = 1.0 - np.arange(1, len(vals) + 1) / len(vals)
+        ax.scatter(vals, ccdf, label=labels.get(name, name), color=colors.get(name, 'black'),
+                   s=10, alpha=0.6, rasterized=True)
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_xlabel('Value')
+    ax.set_ylabel('CCDF P(X > x)')
+    ax.legend(loc='lower left')
+    ax.grid(True, which="both", linestyle='--', alpha=0.4)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "analysis_mem_variance_ccdf.pdf"), bbox_inches='tight', dpi=300)
+    plt.close()
+
 def apply_isolation_forest(df, contamination):
     """Phase 1: Offline Risk Analysis. Segregates tasks into Safe(1) and Risky(-1)."""
     features = ['cpu_mean', 'mem_mean', 'cpu_variance', 'mem_variance']
@@ -129,7 +196,7 @@ def apply_isolation_forest(df, contamination):
         bootstrap=IF_BOOTSTRAP,
         n_jobs=IF_N_JOBS,
         verbose=IF_VERBOSE,
-        random_state=42
+        random_state=RANDOM_SEED
     )
     df_labeled['if_risk_label'] = if_task_analyzer.fit_predict(df_labeled[features])
     return df_labeled, if_task_analyzer
@@ -160,7 +227,7 @@ def get_fallback_server(servers):
     return best_s
 
 # =============================================================================
-# Scheduling Algorithms (Baselines & Proposed)
+# Scheduling Algorithms (Baselines, Proposed & Ablation Variants)
 # =============================================================================
 def schedule_p2c(task, servers):
     """Baseline 1: Power of Two Choices (Workload-Oblivious)"""
@@ -195,13 +262,16 @@ def schedule_p2c(task, servers):
         update_server(target, task)
 
 def schedule_meanrisk_multi(task, servers):
-    """Baseline 2: MeanRiskMulti (Multi-dimensional Statistical Optimizer)"""
+    """Baseline 2: MeanRiskMulti (Multi-Dimensional Statistical Optimizer)"""
     best_server = None
     min_future_risk = float('inf')
     target_pool = servers
 
     if ENABLE_HARD_CAPACITY_CHECK:
-        valid_servers = [s for s in servers if (s['total_cpu_mean'] + task['cpu_mean'] <= 1.0) and (s['total_mem_mean'] + task['mem_mean'] <= 1.0)]
+        valid_servers = [
+            s for s in servers
+            if (s['total_cpu_mean'] + task['cpu_mean'] <= 1.0) and (s['total_mem_mean'] + task['mem_mean'] <= 1.0)
+        ]
         target_pool = valid_servers if valid_servers else servers
 
     for s in target_pool:
@@ -213,7 +283,8 @@ def schedule_meanrisk_multi(task, servers):
             min_future_risk = future_risk
             best_server = s
 
-    if best_server is None: best_server = get_fallback_server(servers)
+    if best_server is None:
+        best_server = get_fallback_server(servers)
     update_server(best_server, task)
 
 def schedule_lbmbp(task, servers, current_global_load):
@@ -228,7 +299,10 @@ def schedule_lbmbp(task, servers, current_global_load):
 
     target_pool = servers
     if ENABLE_HARD_CAPACITY_CHECK:
-        valid_servers = [s for s in servers if (s['total_cpu_mean'] + task['cpu_mean'] <= 1.0) and (s['total_mem_mean'] + task['mem_mean'] <= 1.0)]
+        valid_servers = [
+            s for s in servers
+            if (s['total_cpu_mean'] + task['cpu_mean'] <= 1.0) and (s['total_mem_mean'] + task['mem_mean'] <= 1.0)
+        ]
         target_pool = valid_servers if valid_servers else servers
 
     for s in target_pool:
@@ -238,20 +312,24 @@ def schedule_lbmbp(task, servers, current_global_load):
             min_displacement = displacement
             best_server = s
 
-    if best_server is None: best_server = get_fallback_server(servers)
+    if best_server is None:
+        best_server = get_fallback_server(servers)
     update_server(best_server, task)
     current_global_load['cpu'] += task['cpu_mean']
     current_global_load['mem'] += task['mem_mean']
 
 def schedule_prob(task, servers):
-    """Baseline 4: Probability Density Optimizer"""
+    """Baseline 4: Probability Density Optimizer (PROB)"""
     best_server = None
     max_safety_margin = float('-inf')
     capacity = 1.0
 
     target_pool = servers
     if ENABLE_HARD_CAPACITY_CHECK:
-        valid_servers = [s for s in servers if (s['total_cpu_mean'] + task['cpu_mean'] <= 1.0) and (s['total_mem_mean'] + task['mem_mean'] <= 1.0)]
+        valid_servers = [
+            s for s in servers
+            if (s['total_cpu_mean'] + task['cpu_mean'] <= 1.0) and (s['total_mem_mean'] + task['mem_mean'] <= 1.0)
+        ]
         target_pool = valid_servers if valid_servers else servers
 
     for s in target_pool:
@@ -269,7 +347,8 @@ def schedule_prob(task, servers):
             max_safety_margin = min_z
             best_server = s
 
-    if best_server is None: best_server = get_fallback_server(servers)
+    if best_server is None:
+        best_server = get_fallback_server(servers)
     update_server(best_server, task)
 
 def schedule_if_pareto(task, servers, z_score=Z_SCORE_P95):
@@ -278,7 +357,10 @@ def schedule_if_pareto(task, servers, z_score=Z_SCORE_P95):
     target_pool = servers
 
     if ENABLE_HARD_CAPACITY_CHECK:
-        valid_servers = [s for s in servers if (s['total_cpu_mean'] + task['cpu_mean'] <= 1.0) and (s['total_mem_mean'] + task['mem_mean'] <= 1.0)]
+        valid_servers = [
+            s for s in servers
+            if (s['total_cpu_mean'] + task['cpu_mean'] <= 1.0) and (s['total_mem_mean'] + task['mem_mean'] <= 1.0)
+        ]
         target_pool = valid_servers if valid_servers else servers 
 
     if task['if_risk_label'] == -1:
@@ -300,24 +382,25 @@ def schedule_if_pareto(task, servers, z_score=Z_SCORE_P95):
                 min_future_max_load = future_max_load
                 best_server = s
 
-    if best_server is None: best_server = get_fallback_server(servers)
+    if best_server is None:
+        best_server = get_fallback_server(servers)
     update_server(best_server, task)
 
 # Ablation Study Variants
 def schedule_if_pareto_safe_only(task, servers, z_score=Z_SCORE_P95):
-    """Ablation Baseline: Forces all tasks to undergo Policy A."""
+    """Ablation Baseline (IF-SafeOnly): Forces all tasks to undergo Policy A."""
     fake_task = task.copy()
     fake_task['if_risk_label'] = 1 
     schedule_if_pareto(fake_task, servers, z_score)
 
 def schedule_if_pareto_risky_only(task, servers, z_score=Z_SCORE_P95):
-    """Ablation Baseline: Forces all tasks into Policy B."""
+    """Ablation Baseline (IF-RiskyOnly): Forces all tasks into Policy B."""
     fake_task = task.copy()
     fake_task['if_risk_label'] = -1 
     schedule_if_pareto(fake_task, servers, z_score)
 
 # =============================================================================
-# Simulation Routines
+# Simulation & Plotting Routines
 # =============================================================================
 def run_latency_benchmark(task_pool, if_model, output_dir, n_rounds=10, m_tasks_per_round=1000, profile_name=""):
     logging.info(f"--- Running Algorithmic Latency Benchmark: {profile_name} ---")
@@ -378,20 +461,55 @@ def plot_latency_comparison(df, output_dir, profile_name=""):
     x_pos = np.arange(len(plot_cols))
     colors = plt.cm.viridis(np.linspace(0.2, 0.8, len(plot_cols)))
 
-    ax.bar(x_pos, means[plot_cols], yerr=stds[plot_cols], align='center', alpha=0.9, ecolor='black', capsize=10, color=colors, edgecolor='black', linewidth=1.5)
+    ax.bar(x_pos, means[plot_cols], yerr=stds[plot_cols], align='center', alpha=0.9,
+           ecolor='black', capsize=10, color=colors, edgecolor='black', linewidth=1.5)
     ax.set_ylabel(r'Avg. Decision Latency ($\mu$s)')
-    ax.set_xticks(x_pos); ax.set_xticklabels(plot_cols)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(plot_cols)
     ax.grid(axis='y', linestyle='--', alpha=0.7)
 
     for i, v in enumerate(means[plot_cols]):
         ax.text(i, v + stds[plot_cols].iloc[i] + (v * 0.05), f"{v:.1f}", ha='center', va='bottom', fontweight='bold')
 
     info_text = (f"IF-Inference Cost: {means['IF-Inference']:.2f} $\mu$s\n(Decoupled Phase 1)")
-    ax.text(0.95, 0.95, info_text, transform=ax.transAxes, fontsize=14, va='top', ha='right', bbox=dict(boxstyle="round,pad=0.5", fc="white", ec="gray", alpha=0.9))
+    ax.text(0.95, 0.95, info_text, transform=ax.transAxes, fontsize=14, va='top', ha='right',
+            bbox=dict(boxstyle="round,pad=0.5", fc="white", ec="gray", alpha=0.9))
 
     plt.tight_layout()
     filename_prefix = f"{profile_name}_" if profile_name else ""
     plt.savefig(os.path.join(output_dir, f"{filename_prefix}latency_comparison_plot.pdf"), bbox_inches='tight', dpi=300)
+    plt.close()
+
+def plot_gcp_e2e_latency_cdf(csv_path, output_dir):
+    """Generates Fig. 13 (Empirical CDF of GCP C++ End-to-End Decision Latency) from latency_results_cpp.csv."""
+    if not os.path.exists(csv_path):
+        logging.info(f"GCP latency file '{csv_path}' not found; skipping Fig. 13 CDF generation.")
+        return
+
+    logging.info(f"Generating GCP End-to-End Latency CDF plot from '{csv_path}'...")
+    df_gcp = pd.read_csv(csv_path)
+    if 'Latency_us' not in df_gcp.columns:
+        logging.error("Column 'Latency_us' missing in latency_results_cpp.csv.")
+        return
+
+    latencies = df_gcp['Latency_us'].dropna().values
+    mean_lat = np.mean(latencies)
+    p95_lat = np.percentile(latencies, 95)
+
+    plt.rcParams.update({'font.family': 'DejaVu Sans', 'font.size': 16, 'axes.labelsize': 18})
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    sns.ecdfplot(latencies, ax=ax, linewidth=3, color='tab:blue', label='IF-Pareto (VPC Network)', rasterized=True)
+    ax.axvline(mean_lat, color='tab:red', linestyle=':', linewidth=2.5, label=f'Mean: {mean_lat:.2f} $\mu$s')
+    ax.axvline(p95_lat, color='tab:orange', linestyle='--', linewidth=2.5, label=f'95th: {p95_lat:.2f} $\mu$s')
+
+    ax.set_xlabel(r'End-to-End Latency ($\mu$s)')
+    ax.set_ylabel('Cumulative Probability')
+    ax.legend(loc='lower right', fontsize=14)
+    ax.grid(True, linestyle='-', alpha=0.5)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "latency_real_cdf.pdf"), bbox_inches='tight', dpi=300)
     plt.close()
 
 def run_comparison_simulation(task_pool):
@@ -413,7 +531,11 @@ def run_comparison_simulation(task_pool):
 
         for name, servers in schedulers.items():
             for s in servers:
-                all_results.append({'round': r, 'scheduler': name, 'server_id': s['id'], 'cpu_load': s['total_cpu_mean'], 'mem_load': s['total_mem_mean'], 'task_count': s['task_count']})
+                all_results.append({
+                    'round': r, 'scheduler': name, 'server_id': s['id'],
+                    'cpu_load': s['total_cpu_mean'], 'mem_load': s['total_mem_mean'],
+                    'task_count': s['task_count']
+                })
     return pd.DataFrame(all_results)
 
 def generate_comparison_plots(results_df, output_path_base, profile_name):
@@ -426,44 +548,69 @@ def generate_comparison_plots(results_df, output_path_base, profile_name):
         'xtick.major.width': 1.5, 'ytick.major.width': 1.5
     })
 
-    box_props = {'linewidth': 1.5}; line_props = {'linewidth': 2}
-    cdf_props = {'linewidth': 4}; scatter_props = {'s': 80, 'rasterized': True}
+    box_props = {'linewidth': 1.5}
+    line_props = {'linewidth': 2}
+    cdf_props = {'linewidth': 4, 'rasterized': True}
+    scatter_props = {'s': 80, 'rasterized': True}
 
     p95_cpu = results_df.groupby(['round', 'scheduler'])['cpu_load'].quantile(0.95)
     p95_mem = results_df.groupby(['round', 'scheduler'])['mem_load'].quantile(0.95)
 
-    def calculate_lid(x): return np.std(x) / np.mean(x) if np.mean(x) != 0 else 0
+    def calculate_lid(x):
+        return np.std(x) / np.mean(x) if np.mean(x) != 0 else 0
 
     lid_cpu = results_df.groupby(['round', 'scheduler'])['cpu_load'].apply(calculate_lid)
     lid_mem = results_df.groupby(['round', 'scheduler'])['mem_load'].apply(calculate_lid)
 
-    metrics_df = pd.DataFrame({'P95_CPU': p95_cpu, 'P95_MEM': p95_mem, 'LID_CPU': lid_cpu, 'LID_MEM': lid_mem}).reset_index()
+    metrics_df = pd.DataFrame({
+        'P95_CPU': p95_cpu, 'P95_MEM': p95_mem,
+        'LID_CPU': lid_cpu, 'LID_MEM': lid_mem
+    }).reset_index()
 
     for target in ['IF_Pareto', 'IF_SafeOnly', 'IF_RiskyOnly']:
         metrics_df['scheduler'] = metrics_df['scheduler'].str.replace(target, target.replace('_', '-'))
 
     scaler = MinMaxScaler()
-    metrics_df[['P95_CPU', 'P95_MEM', 'LID_CPU', 'LID_MEM']] = scaler.fit_transform(metrics_df[['P95_CPU', 'P95_MEM', 'LID_CPU', 'LID_MEM']])
+    metrics_df[['P95_CPU', 'P95_MEM', 'LID_CPU', 'LID_MEM']] = scaler.fit_transform(
+        metrics_df[['P95_CPU', 'P95_MEM', 'LID_CPU', 'LID_MEM']]
+    )
 
     scheduler_order = [s.replace('_', '-') for s in ENABLED_SCHEDULERS_LIST]
 
     try:
-        # Boxplots
+        # P95 Boxplots (Figs. 2 & 3)
         fig, axes = plt.subplots(1, 2, figsize=(28, 7))
-        sns.boxplot(ax=axes[0], data=metrics_df, x='scheduler', y='P95_CPU', order=scheduler_order, boxprops=box_props, whiskerprops=line_props, capprops=line_props, medianprops=line_props)
-        axes[0].set_ylabel('P95 Server CPU Load (Normalized)'); axes[0].tick_params(axis='x', rotation=45); axes[0].set_xlabel('')
-        sns.boxplot(ax=axes[1], data=metrics_df, x='scheduler', y='P95_MEM', order=scheduler_order, boxprops=box_props, whiskerprops=line_props, capprops=line_props, medianprops=line_props)
-        axes[1].set_ylabel('P95 Server MEM Load (Normalized)'); axes[1].tick_params(axis='x', rotation=45); axes[1].set_xlabel('')
-        plt.tight_layout(); plt.savefig(f"{output_path_base}_p95_boxplots.pdf", bbox_inches='tight', dpi=300); plt.close()
+        sns.boxplot(ax=axes[0], data=metrics_df, x='scheduler', y='P95_CPU', order=scheduler_order,
+                    boxprops=box_props, whiskerprops=line_props, capprops=line_props, medianprops=line_props)
+        axes[0].set_ylabel('P95 Server CPU Load (Normalized)')
+        axes[0].tick_params(axis='x', rotation=45)
+        axes[0].set_xlabel('Scheduler')
+        sns.boxplot(ax=axes[1], data=metrics_df, x='scheduler', y='P95_MEM', order=scheduler_order,
+                    boxprops=box_props, whiskerprops=line_props, capprops=line_props, medianprops=line_props)
+        axes[1].set_ylabel('P95 Server MEM Load (Normalized)')
+        axes[1].tick_params(axis='x', rotation=45)
+        axes[1].set_xlabel('Scheduler')
+        plt.tight_layout()
+        plt.savefig(f"{output_path_base}_p95_boxplots.pdf", bbox_inches='tight', dpi=300)
+        plt.close()
 
+        # LID Boxplots (Figs. 6 & 7)
         fig, axes = plt.subplots(1, 2, figsize=(28, 7))
-        sns.boxplot(ax=axes[0], data=metrics_df, x='scheduler', y='LID_CPU', order=scheduler_order, boxprops=box_props, whiskerprops=line_props, capprops=line_props, medianprops=line_props)
-        axes[0].set_ylabel('CPU LID (Normalized)'); axes[0].tick_params(axis='x', rotation=45); axes[0].set_xlabel('')
-        sns.boxplot(ax=axes[1], data=metrics_df, x='scheduler', y='LID_MEM', order=scheduler_order, boxprops=box_props, whiskerprops=line_props, capprops=line_props, medianprops=line_props)
-        axes[1].set_ylabel('MEM LID (Normalized)'); axes[1].tick_params(axis='x', rotation=45); axes[1].set_xlabel('')
-        plt.tight_layout(); plt.savefig(f"{output_path_base}_lid_boxplots.pdf", bbox_inches='tight', dpi=300); plt.close()
+        sns.boxplot(ax=axes[0], data=metrics_df, x='scheduler', y='LID_CPU', order=scheduler_order,
+                    boxprops=box_props, whiskerprops=line_props, capprops=line_props, medianprops=line_props)
+        axes[0].set_ylabel('CPU LID (Normalized)')
+        axes[0].tick_params(axis='x', rotation=45)
+        axes[0].set_xlabel('Scheduler')
+        sns.boxplot(ax=axes[1], data=metrics_df, x='scheduler', y='LID_MEM', order=scheduler_order,
+                    boxprops=box_props, whiskerprops=line_props, capprops=line_props, medianprops=line_props)
+        axes[1].set_ylabel('MEM LID (Normalized)')
+        axes[1].tick_params(axis='x', rotation=45)
+        axes[1].set_xlabel('Scheduler')
+        plt.tight_layout()
+        plt.savefig(f"{output_path_base}_lid_boxplots.pdf", bbox_inches='tight', dpi=300)
+        plt.close()
 
-        # Scatter Plots
+        # Scatter Plots with Rasterization for fast PDF rendering (Figs. 4 & 5)
         scatter_df = results_df.copy()
         for target in ['IF_Pareto', 'IF_SafeOnly', 'IF_RiskyOnly']:
             scatter_df['scheduler'] = scatter_df['scheduler'].str.replace(target, target.replace('_', '-'))
@@ -477,22 +624,37 @@ def generate_comparison_plots(results_df, output_path_base, profile_name):
         for ax in g.axes.flat:
             ax.set_frame_on(True)
             for spine in ax.spines.values():
-                spine.set_visible(True); spine.set_linewidth(2.0); spine.set_edgecolor('black')
-        plt.tight_layout(); plt.savefig(f"{output_path_base}_pareto_scatter.pdf", bbox_inches='tight', dpi=300); plt.close()
+                spine.set_visible(True)
+                spine.set_linewidth(2.0)
+                spine.set_edgecolor('black')
+        plt.tight_layout()
+        plt.savefig(f"{output_path_base}_pareto_scatter.pdf", bbox_inches='tight', dpi=300)
+        plt.close()
 
-        # CDF Plots
+        # CDF Plots (Figs. 8 & 9)
         fig, axes = plt.subplots(1, 2, figsize=(20, 7))
-        for s in scheduler_order: sns.ecdfplot(ax=axes[0], data=metrics_df[metrics_df['scheduler'] == s], x='P95_CPU', label=s, **cdf_props)
-        axes[0].set_xlabel('P95 CPU Load (Normalized)'); axes[0].set_ylabel('Cumulative Probability'); axes[0].legend(loc='lower right', fontsize='small'); axes[0].grid(True)
-        for s in scheduler_order: sns.ecdfplot(ax=axes[1], data=metrics_df[metrics_df['scheduler'] == s], x='P95_MEM', label=s, **cdf_props)
-        axes[1].set_xlabel('P95 MEM Load (Normalized)'); axes[1].set_ylabel('Cumulative Probability'); axes[1].legend(loc='lower right', fontsize='small'); axes[1].grid(True)
-        plt.tight_layout(); plt.savefig(f"{output_path_base}_cdf_plots.pdf", bbox_inches='tight', dpi=300); plt.close()
+        for s in scheduler_order:
+            sns.ecdfplot(ax=axes[0], data=metrics_df[metrics_df['scheduler'] == s], x='P95_CPU', label=s, **cdf_props)
+        axes[0].set_xlabel('P95 CPU Load (Normalized)')
+        axes[0].set_ylabel('Cumulative Probability')
+        axes[0].legend(loc='lower right', fontsize='small')
+        axes[0].grid(True)
+
+        for s in scheduler_order:
+            sns.ecdfplot(ax=axes[1], data=metrics_df[metrics_df['scheduler'] == s], x='P95_MEM', label=s, **cdf_props)
+        axes[1].set_xlabel('P95 MEM Load (Normalized)')
+        axes[1].set_ylabel('Cumulative Probability')
+        axes[1].legend(loc='lower right', fontsize='small')
+        axes[1].grid(True)
+        plt.tight_layout()
+        plt.savefig(f"{output_path_base}_cdf_plots.pdf", bbox_inches='tight', dpi=300)
+        plt.close()
 
     except Exception as e:
         logging.error(f"Plotting Error: {e}")
 
 def run_sensitivity_analysis(raw_df, output_dir, profile_name):
-    """Executes sensitivity tests for Contamination Factor and Z-score threshold."""
+    """Executes sensitivity tests for Contamination Factor (Fig. 10) and Z-score threshold (Fig. 11)."""
     sns.set_theme(style="ticks")
     plt.rcParams.update({
         'font.family': 'DejaVu Sans', 'font.size': 24, 'axes.labelsize': 20,
@@ -503,39 +665,59 @@ def run_sensitivity_analysis(raw_df, output_dir, profile_name):
         'xtick.major.width': 3, 'ytick.major.width': 3
     })
 
+    # Exp 1: Contamination Factor Sensitivity
     cont_levels = np.linspace(0.01, 0.20, 10)
     exp1_results = []
-    for cont in tqdm(cont_levels, desc="Sensitivity Exp 1"):
+    for cont in tqdm(cont_levels, desc="Sensitivity Exp 1 (Contamination)"):
         df_labeled, _ = apply_isolation_forest(raw_df, cont)
         for _ in range(N_ROUNDS_SENSITIVITY):
             tasks = df_labeled.sample(n=M_TASKS, replace=True)
             servers = initialize_servers(N_SERVERS)
-            for _, task in tasks.iterrows(): schedule_if_pareto(task, servers, z_score=Z_SCORE_P95)
+            for _, task in tasks.iterrows():
+                schedule_if_pareto(task, servers, z_score=Z_SCORE_P95)
             loads = [s['total_cpu_mean'] for s in servers]
-            exp1_results.append({'Contamination': cont, 'P95 Load': np.percentile(loads, 95), 'LID': np.std(loads) / np.mean(loads) if np.mean(loads) > 0 else 0})
+            exp1_results.append({
+                'Contamination': cont,
+                'P95 Load': np.percentile(loads, 95),
+                'LID': np.std(loads) / np.mean(loads) if np.mean(loads) > 0 else 0
+            })
 
     df_exp1 = pd.DataFrame(exp1_results)
     df_exp1[['P95 Load', 'LID']] = MinMaxScaler().fit_transform(df_exp1[['P95 Load', 'LID']])
 
     fig, ax1 = plt.subplots(figsize=(12, 8))
-    sns.lineplot(data=df_exp1, x='Contamination', y='P95 Load', ax=ax1, marker='o', color='tab:blue', linewidth=4, markersize=12, errorbar='sd', err_style='bars', err_kws={'capsize': 5})
-    ax1.set_xlabel('Contamination Factor'); ax1.set_ylabel('P95 CPU Load (Normalized)', color='tab:blue'); ax1.tick_params(axis='y', labelcolor='tab:blue')
+    sns.lineplot(data=df_exp1, x='Contamination', y='P95 Load', ax=ax1, marker='o',
+                 color='tab:blue', linewidth=4, markersize=12, errorbar='sd',
+                 err_style='bars', err_kws={'capsize': 5})
+    ax1.set_xlabel('Contamination Factor')
+    ax1.set_ylabel('P95 CPU Load (Normalized)', color='tab:blue')
+    ax1.tick_params(axis='y', labelcolor='tab:blue')
 
     ax2 = ax1.twinx()
-    sns.lineplot(data=df_exp1, x='Contamination', y='LID', ax=ax2, marker='s', color='tab:red', linewidth=4, markersize=12, linestyle='--', errorbar='sd', err_style='bars', err_kws={'capsize': 5})
-    ax2.set_ylabel('LID (Normalized)', color='tab:red'); ax2.tick_params(axis='y', labelcolor='tab:red')
+    sns.lineplot(data=df_exp1, x='Contamination', y='LID', ax=ax2, marker='s',
+                 color='tab:red', linewidth=4, markersize=12, linestyle='--', errorbar='sd',
+                 err_style='bars', err_kws={'capsize': 5})
+    ax2.set_ylabel('LID (Normalized)', color='tab:red')
+    ax2.tick_params(axis='y', labelcolor='tab:red')
 
-    plt.tight_layout(); plt.savefig(os.path.join(output_dir, f"{profile_name}_exp1_contamination.pdf"), bbox_inches='tight', dpi=300); plt.close()
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{profile_name}_exp1_contamination.pdf"), bbox_inches='tight', dpi=300)
+    plt.close()
 
-    risk_levels = {'P80': norm.ppf(0.80), 'P85': norm.ppf(0.85), 'P90': norm.ppf(0.90), 'P95': norm.ppf(0.95), 'P99': norm.ppf(0.99)}
+    # Exp 2: Risk Threshold (Regularization Weight Z) Sensitivity
+    risk_levels = {
+        'P80': norm.ppf(0.80), 'P85': norm.ppf(0.85),
+        'P90': norm.ppf(0.90), 'P95': norm.ppf(0.95), 'P99': norm.ppf(0.99)
+    }
     df_labeled_fixed, _ = apply_isolation_forest(raw_df, IF_CONTAMINATION)
     exp2_results = []
     
-    for label, z_val in tqdm(risk_levels.items(), desc="Sensitivity Exp 2"):
+    for label, z_val in tqdm(risk_levels.items(), desc="Sensitivity Exp 2 (Z-Score)"):
         for _ in range(N_ROUNDS_SENSITIVITY):
             tasks = df_labeled_fixed.sample(n=M_TASKS, replace=True)
             servers = initialize_servers(N_SERVERS)
-            for _, task in tasks.iterrows(): schedule_if_pareto(task, servers, z_score=z_val)
+            for _, task in tasks.iterrows():
+                schedule_if_pareto(task, servers, z_score=z_val)
             loads = [s['total_cpu_mean'] for s in servers]
             exp2_results.append({'Risk Level': label, 'Metric': 'P95 Load', 'Value': np.percentile(loads, 95)})
             exp2_results.append({'Risk Level': label, 'Metric': 'LID', 'Value': np.std(loads) / np.mean(loads) if np.mean(loads) > 0 else 0})
@@ -543,17 +725,32 @@ def run_sensitivity_analysis(raw_df, output_dir, profile_name):
     df_exp2 = pd.DataFrame(exp2_results)
     for m in ['P95 Load', 'LID']:
         mask = df_exp2['Metric'] == m
-        if mask.any(): df_exp2.loc[mask, ['Value']] = MinMaxScaler().fit_transform(df_exp2.loc[mask, ['Value']])
+        if mask.any():
+            df_exp2.loc[mask, ['Value']] = MinMaxScaler().fit_transform(df_exp2.loc[mask, ['Value']])
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 7))
-    sns.barplot(data=df_exp2[df_exp2['Metric']=='P95 Load'], x='Risk Level', y='Value', ax=axes[0], hue='Risk Level', legend=False, palette='viridis', edgecolor='black', linewidth=2, errorbar='sd', capsize=0.1)
-    axes[0].set_ylabel('P95 CPU Load (Normalized)'); axes[0].set_xlabel('Risk Threshold (Z-score)')
-    sns.barplot(data=df_exp2[df_exp2['Metric']=='LID'], x='Risk Level', y='Value', ax=axes[1], hue='Risk Level', legend=False, palette='magma', edgecolor='black', linewidth=2, errorbar='sd', capsize=0.1)
-    axes[1].set_ylabel('LID (Normalized)'); axes[1].set_xlabel('Risk Threshold (Z-score)')
+    sns.barplot(data=df_exp2[df_exp2['Metric'] == 'P95 Load'], x='Risk Level', y='Value',
+                ax=axes[0], hue='Risk Level', legend=False, palette='viridis',
+                edgecolor='black', linewidth=2, errorbar='sd', capsize=0.1)
+    axes[0].set_ylabel('P95 CPU Load (Normalized)')
+    axes[0].set_xlabel('Risk Threshold (Z-score)')
 
-    plt.tight_layout(); plt.savefig(os.path.join(output_dir, f"{profile_name}_exp2_zscore.pdf"), bbox_inches='tight', dpi=300); plt.close()
+    sns.barplot(data=df_exp2[df_exp2['Metric'] == 'LID'], x='Risk Level', y='Value',
+                ax=axes[1], hue='Risk Level', legend=False, palette='magma',
+                edgecolor='black', linewidth=2, errorbar='sd', capsize=0.1)
+    axes[1].set_ylabel('LID (Normalized)')
+    axes[1].set_xlabel('Risk Threshold (Z-score)')
 
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{profile_name}_exp2_zscore.pdf"), bbox_inches='tight', dpi=300)
+    plt.close()
+
+# =============================================================================
+# Main Execution Entry
+# =============================================================================
 def main():
+    np.random.seed(RANDOM_SEED)
+
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_output_dir_name = f"sim_run_{SCRIPT_VERSION}_{timestamp}"
     run_output_dir_path = os.path.join(BASE_OUTPUT_DIR, run_output_dir_name)
@@ -564,24 +761,44 @@ def main():
         print(f"Critical Error: Cannot create output directory {e}")
         return
 
-    log_file_path = os.path.join(run_output_dir_path, f"sim_run.log")
-    logging.basicConfig(level=logging.INFO, format='%(message)s', handlers=[logging.FileHandler(log_file_path), logging.StreamHandler()])
+    log_file_path = os.path.join(run_output_dir_path, "sim_run.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(message)s',
+        handlers=[logging.FileHandler(log_file_path), logging.StreamHandler()]
+    )
 
     logging.info("=== IF-Pareto Simulator Initiated ===")
-    params_to_log = {"VERSION": SCRIPT_VERSION, "SCHEDULERS": ENABLED_SCHEDULERS_LIST, "WORKLOADS": SELECTED_WORKLOADS}
-    for k, v in params_to_log.items(): logging.info(f"{k}: {v}")
+    params_to_log = {
+        "VERSION": SCRIPT_VERSION,
+        "N_SERVERS": N_SERVERS,
+        "M_TASKS": M_TASKS,
+        "R_ROUNDS": R_ROUNDS,
+        "IF_CONTAMINATION": IF_CONTAMINATION,
+        "Z_SCORE_P95": Z_SCORE_P95,
+        "SCHEDULERS": ENABLED_SCHEDULERS_LIST,
+        "WORKLOADS": SELECTED_WORKLOADS
+    }
+    for k, v in params_to_log.items():
+        logging.info(f"{k}: {v}")
 
     target_workloads = {k: v for k, v in ALL_WORKLOAD_PROFILES.items() if k in SELECTED_WORKLOADS}
+    loaded_traces = {}
 
     for profile_name, filepath in target_workloads.items():
         raw_data = load_raw_data(filepath)
-        if raw_data is None: continue
+        if raw_data is not None:
+            loaded_traces[profile_name] = raw_data
 
+    if RUN_WORKLOAD_ANALYSIS and loaded_traces:
+        analyze_and_plot_workload_stats(loaded_traces, run_output_dir_path)
+
+    for profile_name, raw_data in loaded_traces.items():
         output_path_base = os.path.join(run_output_dir_path, f"{profile_name}")
         labeled_data, if_model = apply_isolation_forest(raw_data, IF_CONTAMINATION)
 
         if RUN_COMPARISON:
-            logging.info(f"\n--- Comparison Simulation: {profile_name} ---")
+            logging.info(f"\n--- Comparison Simulation ({R_ROUNDS} Rounds): {profile_name} ---")
             results_df = run_comparison_simulation(labeled_data)
             results_df.to_csv(f"{output_path_base}_results.csv", index=False)
             generate_comparison_plots(results_df, output_path_base, profile_name)
@@ -591,8 +808,13 @@ def main():
             plot_latency_comparison(df_latency, run_output_dir_path, profile_name=profile_name)
 
         if RUN_SENSITIVITY_ANALYSIS:
-            logging.info(f"\n--- Sensitivity Analysis: {profile_name} ---")
+            logging.info(f"\n--- Sensitivity Analysis ({N_ROUNDS_SENSITIVITY} Rounds): {profile_name} ---")
             run_sensitivity_analysis(raw_data, run_output_dir_path, profile_name)
+
+    if PLOT_GCP_TESTBED_CDF:
+        plot_gcp_e2e_latency_cdf(GCP_LATENCY_CSV_PATH, run_output_dir_path)
+
+    logging.info(f"\n=== All simulations completed! Results saved to: {run_output_dir_path} ===")
 
 if __name__ == "__main__":
     main()
